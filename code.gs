@@ -6,15 +6,22 @@ const TWILIO_AUTH_TOKEN = 'TWILIO_AUTH_TOKEN';
 const TWILIO_PHONE_NUMBER = 'TWILIO_PHONE_NUMBER';
 
 /**
- * Contact Information
- * Note: Zero Based Indexing. A = 0, B = 1, ....
- * Will store as a A, B, C
+ * Columns
  */
 const CONTACT_NAME_COLUMN = 'CONTACT_NAME_COLUMN';
 const CONTACT_PHONE_NUMBER_COLUMN = 'CONTACT_PHONE_NUMBER_COLUMN';
 const MESSAGE_COLUMN = 'MESSAGE_COLUMN';
-const RESULT_COLUMN = 'RESULT_COLUMN';
+const SID_COLUMN = 'SID_COLUMN';
+const STATUS_COLUMN = 'STATUS_COLUMN';
 
+/**
+ * Twilio Message Status
+ */
+const MESSAGE_STATUS_FINAL = ['delivered', 'undelivered', 'failed'];
+
+/**
+ * Google Sheets UI
+ */
 const ui = SpreadsheetApp.getUi();
 const userProperties = PropertiesService.getUserProperties();
 
@@ -29,13 +36,15 @@ function onOpen() {
     .addItem('Set Twilio phone number', 'setTwilioPhoneNumber')
     .addItem('Set Contact Phone Number Column', 'setContactPhoneNumberColumn')
     .addItem('Set Message Column', 'setMessageColumn')
-    .addItem('Set Result Column', 'setResultColumn')
+    .addItem('Set SID Column', 'setSIDColumn')
+    .addItem('Set Status Column', 'setStatusColumn')
     .addItem('Delete Twilio Account SID', 'deleteTwilioAccountSID')
     .addItem('Delete Twilio Auth Token', 'deleteTwilioAuthToken')
     .addItem('Delete Twilio phone number', 'deleteTwilioPhoneNumber')
     .addToUi();
   ui.createMenu('Twilio - Actions')
     .addItem('Send SMS to All', 'sendSmsToAll')
+    .addItem('Check Status', 'checkStatus')
     .addToUi();
 };
 
@@ -70,11 +79,6 @@ function deleteTwilioPhoneNumber() {
   userProperties.deleteProperty(TWILIO_PHONE_NUMBER);
 };
 
-function setResultColumn() {
-  const scriptValue = ui.prompt('Enter your Result Column', ui.ButtonSet.OK);
-  userProperties.setProperty(RESULT_COLUMN, scriptValue.getResponseText());
-}
-
 function setContactPhoneNumberColumn () {
   const scriptValue = ui.prompt('Enter your Contact Phone Number Column', ui.ButtonSet.OK);
   userProperties.setProperty(CONTACT_PHONE_NUMBER_COLUMN, scriptValue.getResponseText());
@@ -85,9 +89,39 @@ function setMessageColumn () {
   userProperties.setProperty(MESSAGE_COLUMN, scriptValue.getResponseText());
 }
 
+function setSIDColumn () {
+  const scriptValue = ui.prompt('Enter your SID Column', ui.ButtonSet.OK);
+  userProperties.setProperty(SID_COLUMN, scriptValue.getResponseText());
+}
+
+function setStatusColumn () {
+  const scriptValue = ui.prompt('Enter your Status Column', ui.ButtonSet.OK);
+  userProperties.setProperty(STATUS_COLUMN, scriptValue.getResponseText());
+}
+
 /**
  * Twilio / Helper Methods
  */
+
+function fetchMessage(messageSID) {
+  const twilioAccountSID = userProperties.getProperty('TWILIO_ACCOUNT_SID');
+  const twilioAuthToken = userProperties.getProperty('TWILIO_AUTH_TOKEN');
+  const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${twilioAccountSID}/Messages/${messageSID}.json`;
+  const authenticationString = twilioAccountSID + ':' + twilioAuthToken;
+
+  try {
+    const response = UrlFetchApp.fetch(twilioUrl, {
+      method: 'get',
+      headers: {
+        Authorization: 'Basic ' + Utilities.base64Encode(authenticationString)
+      }
+    });
+
+    return response.getContentText();
+  } catch (err) {
+    return err;
+  }
+}
 
 function sendSms(payload) {
   const twilioAccountSID = userProperties.getProperty('TWILIO_ACCOUNT_SID');
@@ -107,15 +141,44 @@ function sendSms(payload) {
     console.log(response);
     return response.getContentText();
   } catch (err) {
-    return 'error: ' + err;
+    return err;
   }
 };
+
+function checkStatus() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const rows = sheet.getDataRange().getValues();
+  const headers = rows.shift();
+  const sidColumnIndex = letterToColumn(userProperties.getProperty(SID_COLUMN));
+  const statusColumnIndex = letterToColumn(userProperties.getProperty(STATUS_COLUMN));
+
+  for (const aRow of rows) {
+    const sid = aRow[sidColumnIndex];
+    const status = aRow[statusColumnIndex];
+
+    if(sid && status && !MESSAGE_STATUS_FINAL.includes(status)) {
+      // Fetch the Message
+      const result = fetchMessage(sid);
+      if(typeof result === 'string') {
+        const {status} = JSON.parse(result);
+        aRow[statusColumnIndex] = status;
+      } else {
+        aRow[statusColumnIndex] = result;
+      }
+
+      
+    }
+  }
+
+  sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+}
 
 function sendSmsToAll() {
   const sheet = SpreadsheetApp.getActiveSheet();
   const rows = sheet.getDataRange().getValues();
   const headers = rows.shift();
-  const resultColumnIndex = letterToColumn(userProperties.getProperty(RESULT_COLUMN));
+  const sidColumnIndex = letterToColumn(userProperties.getProperty(SID_COLUMN));
+  const statusColumnIndex = letterToColumn(userProperties.getProperty(STATUS_COLUMN));
   const messageColumnIndex = letterToColumn(userProperties.getProperty(MESSAGE_COLUMN));
   const contactPhoneNumberColumnIndex = letterToColumn(userProperties.getProperty(CONTACT_PHONE_NUMBER_COLUMN));
   
@@ -125,7 +188,7 @@ function sendSmsToAll() {
     const contactPhoneNumber = aRow[contactPhoneNumberColumnIndex];
     const message = aRow[messageColumnIndex];
     // Check to see is Contact Phone Number and Message
-    if(contactPhoneNumber && message) {
+    if(validatePhoneForE164(contactPhoneNumber) && message) {
       const payload = {
         To: contactPhoneNumber,
         From: twilioPhoneNumber,
@@ -134,11 +197,28 @@ function sendSmsToAll() {
 
       const result = sendSms(payload);
 
-      console.log(`result: ${result}`);
+      // Check to see if the result row is declare.
+      if(sidColumnIndex && statusColumnIndex && typeof result === 'string') {
+        const {sid, status} = JSON.parse(result);
+        aRow[sidColumnIndex] = sid;
+        aRow[statusColumnIndex] = status;
+      } else {
+        aRow[sidColumnIndex] = result;
+      }
+    } else {
+      let errorMessage = [];
+
+      if(!validatePhoneForE164(contactPhoneNumber)) {
+        errorMessage.push(`Please double check the phone number. It needs to be the following format: +155555555555`);
+      }
+
+      if(!message) {
+        errorMessage.push(`Please include an message`);
+      }
 
       // Check to see if the result row is declare.
-      if(resultColumnIndex) {
-        aRow[resultColumnIndex] = result;
+      if(sidColumnIndex) {
+        aRow[sidColumnIndex] = errorMessage.join('\n');
       }
     }
   });
